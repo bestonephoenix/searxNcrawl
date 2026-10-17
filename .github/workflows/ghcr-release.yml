@@ -9,13 +9,17 @@
 # done by ~/.hermes/scripts/searxncrawl-sync.sh, which holds a token that can.
 #
 # This workflow only reads and builds:
-#   * resolves the release tag (input, else newest upstream release)
-#   * skips cleanly when the fork has no such tag yet or the release exists
+#   * triggers on a mirrored v* tag, an explicit dispatch, or a 6-hourly sweep
+#   * skips cleanly when the tag is missing here or the release already exists
 #   * builds the Dockerfile at that tag and pushes ghcr.io/<owner>/searxncrawl
 #   * publishes the mirrored GitHub release with upstream's notes
 name: GHCR release
 
 on:
+  push:
+    tags: ["v*"]
+  repository_dispatch:
+    types: [searxncrawl-release]
   workflow_dispatch:
     inputs:
       tag:
@@ -27,11 +31,9 @@ on:
         required: false
         type: boolean
         default: false
-  repository_dispatch:
-    types: [searxncrawl-release]
   schedule:
-    # Safety net only: publishes if a release tag is already mirrored here but
-    # the image is missing (e.g. the dispatch after a sync was lost).
+    # Safety net: catches a release whose tag is mirrored but whose image or
+    # release object is missing (lost dispatch, failed build).
     - cron: "23 */6 * * *"
 
 permissions:
@@ -39,7 +41,7 @@ permissions:
   packages: write
 
 concurrency:
-  group: ghcr-release
+  group: ghcr-release-${{ github.ref_name }}
   cancel-in-progress: false
 
 env:
@@ -51,32 +53,33 @@ jobs:
     name: build & publish
     runs-on: ubuntu-24.04
     timeout-minutes: 90
-    outputs:
-      tag: ${{ steps.resolve.outputs.tag }}
-      publish: ${{ steps.resolve.outputs.publish }}
     steps:
       - name: Resolve the release tag
         id: resolve
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          REQUESTED_TAG: ${{ inputs.tag }}
+          # push:tags -> ref_name is the tag; dispatch -> client_payload/input.
+          REQUESTED_TAG: ${{ inputs.tag || github.event.client_payload.tag || github.ref_name }}
           FORCE: ${{ inputs.force }}
         run: |
           set -euo pipefail
 
-          tag="${REQUESTED_TAG:-}"
+          raw="${REQUESTED_TAG:-}"
+          case "$raw" in
+            v[0-9]*) tag="$raw" ;;
+            *)       tag="" ;;   # e.g. ref_name=main on schedule/workflow_dispatch
+          esac
           if [ -z "$tag" ]; then
             tag="$(gh api "repos/${UPSTREAM_REPO}/releases/latest" --jq .tag_name)"
           fi
           echo "release tag: ${tag}"
 
           # The tag has to be mirrored into this repo first (done by the sync
-          # script). Building from a tag that only exists upstream would produce
-          # a release object pointing at nothing here.
+          # script); building from a tag that only exists upstream would create a
+          # release object pointing at nothing here.
           if ! gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${tag}" >/dev/null 2>&1; then
             echo "::notice::Tag ${tag} is not mirrored into ${GITHUB_REPOSITORY} yet - nothing to publish"
             echo "publish=false" >> "$GITHUB_OUTPUT"
-            echo "tag=${tag}" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
@@ -89,8 +92,20 @@ jobs:
             publish=true
           fi
 
-          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
-          echo "publish=${publish}" >> "$GITHUB_OUTPUT"
+          # metadata-action's semver types read github.ref, which is `main` on
+          # schedule/dispatch runs, so derive the image tags explicitly.
+          version="${tag#v}"
+          minor="$(printf '%s' "$version" | cut -d. -f1,2)"
+          latest_upstream="$(gh api "repos/${UPSTREAM_REPO}/releases/latest" --jq .tag_name 2>/dev/null || true)"
+          if [ "$tag" = "$latest_upstream" ]; then is_latest=true; else is_latest=false; fi
+
+          {
+            echo "tag=${tag}"
+            echo "publish=${publish}"
+            echo "version=${version}"
+            echo "minor=${minor}"
+            echo "is_latest=${is_latest}"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Check out the release tag
         if: steps.resolve.outputs.publish == 'true'
@@ -111,17 +126,20 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Derive image tags
+      - name: Derive image metadata
         if: steps.resolve.outputs.publish == 'true'
         id: meta
         uses: docker/metadata-action@v5
         with:
           images: ${{ env.IMAGE_NAME }}
           tags: |
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-          flavor: |
-            latest=auto
+            type=raw,value=${{ steps.resolve.outputs.version }}
+            type=raw,value=${{ steps.resolve.outputs.minor }}
+            type=raw,value=latest,enable=${{ steps.resolve.outputs.is_latest }}
+          labels: |
+            org.opencontainers.image.version=${{ steps.resolve.outputs.version }}
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.url=https://github.com/${{ env.UPSTREAM_REPO }}
 
       - name: Build and push image
         if: steps.resolve.outputs.publish == 'true'
@@ -140,6 +158,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ steps.resolve.outputs.tag }}
+          VERSION: ${{ steps.resolve.outputs.version }}
         run: |
           set -euo pipefail
           upstream_body="$(gh api "repos/${UPSTREAM_REPO}/releases/tags/${TAG}" --jq .body 2>/dev/null || true)"
@@ -147,10 +166,10 @@ jobs:
           {
             echo "Mirror of [\`${UPSTREAM_REPO}@${TAG}\`](https://github.com/${UPSTREAM_REPO}/releases/tag/${TAG})."
             echo
-            echo "Image: \`${IMAGE_NAME}:${TAG#v}\`"
+            echo "Image: \`${IMAGE_NAME}:${VERSION}\`"
             echo
             echo '```'
-            echo "docker pull ${IMAGE_NAME}:${TAG#v}"
+            echo "docker pull ${IMAGE_NAME}:${VERSION}"
             echo '```'
             echo
             echo "---"
