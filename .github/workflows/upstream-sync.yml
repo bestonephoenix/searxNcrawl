@@ -15,6 +15,11 @@
 name: Upstream sync & GHCR release
 
 on:
+  push:
+    # Fast path: a push to main (e.g. this workflow being merged) runs the sync
+    # immediately instead of waiting for the next poll. Pushes made by the sync
+    # job itself use GITHUB_TOKEN and therefore never re-trigger this workflow.
+    branches: [main]
   schedule:
     # Every 15 minutes. GitHub runs scheduled jobs best-effort and can delay them
     # by up to ~15 min under load; that is fine for release mirroring.
