@@ -1,0 +1,216 @@
+# Keeps bestonephoenix/searxNcrawl in lockstep with DasDigitaleMomentum/searxNcrawl
+# and republishes every upstream release as a container image in GHCR.
+#
+# Why polling: GitHub only delivers a `release` event to workflows inside the repo
+# that published it, so your fork can never be triggered directly by an upstream
+# release. This workflow polls upstream instead. You can also trigger it yourself
+# (Actions -> Run workflow) or from any external cron via a repository_dispatch
+# event of type `upstream-release`.
+#
+# Jobs:
+#   sync     - merge upstream main (fast-forward when possible, otherwise a merge
+#              commit), mirror upstream tags, pick the newest upstream release.
+#   publish  - build that tag with this repo's own Dockerfile, push it to
+#              ghcr.io/<owner>/searxncrawl, then publish a mirror release.
+name: Upstream sync & GHCR release
+
+on:
+  push:
+    # Fast path: a push to main (e.g. this workflow being merged) runs the sync
+    # immediately instead of waiting for the next poll. Pushes made by the sync
+    # job itself use GITHUB_TOKEN and therefore never re-trigger this workflow.
+    branches: [main]
+  schedule:
+    # Every 15 minutes. GitHub runs scheduled jobs best-effort and can delay them
+    # by up to ~15 min under load; that is fine for release mirroring.
+    - cron: "7,22,37,52 * * * *"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Upstream tag to sync and publish (empty = latest upstream release)"
+        required: false
+        type: string
+      force:
+        description: "Rebuild and republish even if this release already exists"
+        required: false
+        type: boolean
+        default: false
+  repository_dispatch:
+    types: [upstream-release]
+
+permissions:
+  contents: write
+  packages: write
+  actions: write
+
+concurrency:
+  group: upstream-sync
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPO: DasDigitaleMomentum/searxNcrawl
+  IMAGE_NAME: ghcr.io/${{ github.repository_owner }}/searxncrawl
+
+jobs:
+  sync:
+    name: sync upstream
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    outputs:
+      tag: ${{ steps.resolve.outputs.tag }}
+      publish: ${{ steps.resolve.outputs.publish }}
+    steps:
+      - name: Check out fork main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Merge upstream main and mirror tags
+        run: |
+          set -euo pipefail
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git remote add upstream "https://github.com/${UPSTREAM_REPO}.git"
+          git fetch --prune --tags upstream main
+
+          if git merge-base --is-ancestor refs/remotes/upstream/main HEAD; then
+            echo "main already contains every upstream commit"
+          else
+            # Forward-only: never force-push, so fork-local commits survive.
+            # A conflict here fails the job on purpose - resolve it locally and
+            # re-run, rather than letting a half-merged tree get published.
+            git merge --no-edit "refs/remotes/upstream/main"
+            git push origin main
+          fi
+
+          # Mirror upstream tags (existing tags are no-ops, not overwritten).
+          git push origin --tags
+
+      - name: Disable upstream PyPI workflow in this fork
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Upstream publishes to PyPI via Trusted Publishing that only exists for
+          # DasDigitaleMomentum/searxNcrawl. Left enabled, every mirrored release
+          # here would end in a red PyPI job. Disabling is a repo setting, so it
+          # survives upstream merges.
+          gh api -X PUT "repos/${GITHUB_REPOSITORY}/actions/workflows/release.yml/disable"
+
+      - name: Resolve the upstream release to publish
+        id: resolve
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REQUESTED_TAG: ${{ inputs.tag }}
+          FORCE: ${{ inputs.force }}
+        run: |
+          set -euo pipefail
+
+          tag="${REQUESTED_TAG:-}"
+          if [ -z "$tag" ]; then
+            tag="$(gh api "repos/${UPSTREAM_REPO}/releases/latest" --jq .tag_name 2>/dev/null || true)"
+          fi
+          if [ -z "$tag" ]; then
+            # No published release object upstream: fall back to the newest tag.
+            tag="$(git tag --list 'v*' --sort=-v:refname | head -n1)"
+          fi
+          if [ -z "$tag" ]; then
+            echo "::error::Could not determine an upstream release tag"
+            exit 1
+          fi
+          echo "upstream tag: $tag"
+
+          # Make sure the tag exists here (and therefore on the fork) before building.
+          if ! git rev-parse -q --verify "refs/tags/${tag}" >/dev/null; then
+            git fetch upstream "refs/tags/${tag}:refs/tags/${tag}"
+            git push origin "refs/tags/${tag}"
+          fi
+
+          if [ "${FORCE}" = "true" ]; then
+            publish=true
+          elif gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            publish=false
+          else
+            publish=true
+          fi
+
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+          echo "publish=${publish}" >> "$GITHUB_OUTPUT"
+          echo "publish=${publish} for ${tag}"
+
+  publish:
+    name: build & publish
+    needs: sync
+    if: needs.sync.outputs.publish == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - name: Check out the release tag
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.sync.outputs.tag }}
+          fetch-depth: 1
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Derive image tags
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE_NAME }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+          flavor: |
+            latest=auto
+
+      - name: Build and push image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          platforms: linux/amd64
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Publish the mirrored GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.sync.outputs.tag }}
+        run: |
+          set -euo pipefail
+          upstream_body="$(gh api "repos/${UPSTREAM_REPO}/releases/tags/${TAG}" --jq .body 2>/dev/null || true)"
+
+          {
+            echo "Mirror of [\`${UPSTREAM_REPO}@${TAG}\`](https://github.com/${UPSTREAM_REPO}/releases/tag/${TAG})."
+            echo
+            echo "Image: \`${IMAGE_NAME}:${TAG#v}\`"
+            echo
+            echo '```'
+            echo "docker pull ${IMAGE_NAME}:${TAG#v}"
+            echo '```'
+            echo
+            echo "---"
+            echo
+            printf '%s\n' "${upstream_body}"
+          } > notes.md
+
+          if gh release view "${TAG}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            gh release edit "${TAG}" --repo "${GITHUB_REPOSITORY}" --notes-file notes.md
+          else
+            gh release create "${TAG}" --repo "${GITHUB_REPOSITORY}" \
+              --title "${TAG}" --notes-file notes.md --verify-tag
+          fi
