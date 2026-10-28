@@ -7,7 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Optional Arcade worker adapter pinned to the published `searxncrawl==0.33.0` package, with isolated search credentials, native crawl tools and a Debian container with Chromium. Requires a Playwright-compatible host; Arcade Cloud's current musllinux runner cannot install the package.
+
 ### Changed
+- Correct repository docs for native MCP setup, opt-in HTTP header protection, optional Arcade deployment and current module behavior; remove roadmap text from the README.
 - Document direct PyPI/MCPB installation and retire the unavailable Smithery publishing step following Smithery's API/CLI shutdown announcement.
 
 ## [0.33.0] - 2026-10-28
