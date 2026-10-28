@@ -9,12 +9,15 @@ attributed via ``providers``. A partial failure is tolerated; a total failure ra
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import math
 import os
+import re
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
+from pathlib import Path
 from typing import Any, Awaitable, Callable, Optional, Sequence
 from urllib.parse import urlsplit, urlunsplit
 
@@ -58,6 +61,40 @@ class ProviderConfig:
     api_key: str = ""
     username: str = ""
     password: str = ""
+    extra_headers: dict[str, str] = field(default_factory=dict, repr=False)
+
+
+def _searxng_extra_headers() -> Optional[dict[str, str]]:
+    """Resolve operator headers; None disables SearXNG on invalid configuration."""
+    raw = os.getenv("SEARXNG_EXTRA_HEADERS", "").strip()
+    if not raw:
+        return {}
+    try:
+        parsed = json.loads(raw)
+        if not isinstance(parsed, dict):
+            raise ValueError
+        headers = {}
+        for name, value in parsed.items():
+            if not re.fullmatch(r"[!#$%&'*+.^_`|~0-9A-Za-z-]+", name):
+                raise ValueError
+            if not isinstance(value, str):
+                raise ValueError
+            if value.startswith("@"):
+                path = Path(value[1:]).expanduser()
+                if not path.is_absolute():
+                    raise ValueError
+                value = path.read_text(encoding="utf-8").strip()
+            if not value.isascii() or any(ord(ch) < 32 or ord(ch) == 127 for ch in value):
+                raise ValueError
+            headers[name] = value
+        return headers
+    except (OSError, ValueError):
+        # Exception text can expose header secrets or their file paths.
+        LOGGER.warning(
+            "SEARXNG_EXTRA_HEADERS is invalid (JSON object of ASCII header names "
+            "and string values; files require absolute or ~/ paths); SearXNG is disabled"
+        )
+        return None
 
 
 def _absolute_http_url(value: Optional[str]) -> Optional[str]:
@@ -85,6 +122,7 @@ def _resolve_provider_config() -> dict[str, ProviderConfig]:
     username = os.getenv("SEARXNG_USERNAME", "").strip()
     password = os.getenv("SEARXNG_PASSWORD", "").strip()
     credentials_valid = bool(username) == bool(password)
+    extra_headers = _searxng_extra_headers()
     # Name the variable and rule only; values may contain credentials.
     if raw_url and not searxng_url:
         LOGGER.warning(
@@ -96,12 +134,13 @@ def _resolve_provider_config() -> dict[str, ProviderConfig]:
             "Only one of SEARXNG_USERNAME/SEARXNG_PASSWORD is set (set both or "
             "neither); SearXNG is disabled"
         )
-    if searxng_url and credentials_valid:
+    if searxng_url and credentials_valid and extra_headers is not None:
         configured[SEARXNG] = ProviderConfig(
             provider=SEARXNG,
             base_url=searxng_url,
             username=username,
             password=password,
+            extra_headers=extra_headers,
         )
 
     api_key = os.getenv("YDC_API_KEY", "").strip()
@@ -288,11 +327,16 @@ async def _search_searxng(
         if config.username and config.password
         else None
     )
+    headers = {
+        name: value for name, value in config.extra_headers.items()
+        if name.lower() not in {"accept", "content-type"}
+    }
+    headers.update({"Accept": "application/json", "Content-Type": "application/json"})
     payload = await _request_json(
         "GET",
         f"{config.base_url}/search",
         params=params,
-        headers={"Accept": "application/json", "Content-Type": "application/json"},
+        headers=headers,
         auth=auth,
         max_retries=max_retries,
         status_reason=_searxng_status_reason,
@@ -529,13 +573,35 @@ def _parse_search_result_fields() -> Optional[list[str]]:
     return fields
 
 
+async def crawl_result_pages(results: Sequence[SearchResult]) -> list[Any]:
+    """Crawl every result URL to Markdown; one document per result, in order."""
+    if not results:
+        return []
+    # Local import: plain searches never load Crawl4AI.
+    from . import crawl_pages_async
+
+    # Same per-page timeout as the MCP crawl tool, so a search stays responsive.
+    return await crawl_pages_async([result.url for result in results], timeout=15)
+
+
 def serialize_search_results(
-    query: str, results: Sequence[SearchResult]
+    query: str,
+    results: Sequence[SearchResult],
+    documents: Optional[Sequence[Any]] = None,
 ) -> dict[str, Any]:
-    """Build the search envelope, applying SEARCH_RESULT_FIELDS to each result."""
+    """Build the search envelope, applying SEARCH_RESULT_FIELDS to each result.
+
+    ``documents`` (from ``crawl_result_pages``) adds ``markdown`` to each result,
+    or ``crawl_error`` when its page could not be crawled.
+    """
     fields = _parse_search_result_fields()
     items = [asdict(result) for result in results]
     if fields is not None:
         field_set = set(fields)
         items = [{k: v for k, v in item.items() if k in field_set} for item in items]
+    for item, doc in zip(items, documents or ()):
+        if doc.status == "success":
+            item["markdown"] = doc.markdown
+        else:
+            item["crawl_error"] = doc.error_message or "crawl failed"
     return {"query": query, "number_of_results": len(items), "results": items}
