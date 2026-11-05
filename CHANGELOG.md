@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.33.2] - 2026-11-05
+
+### Changed
+- The PyPI homepage points to the project website, https://www.searxncrawl.io/, like the MCP Registry entry and the MCPB bundle.
+
 ## [0.33.1] - 2026-10-29
 
 ### Fixed
